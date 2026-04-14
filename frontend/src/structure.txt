@@ -1,0 +1,51 @@
+Folder PATH listing
+Volume serial number is 32D9-0B9C
+D:.
+|   App.jsx
+|   index.css
+|   main.jsx
+|   structure.txt
+|   
++---assets
+|       hero.png
+|       
++---features
+|   +---inventory
+|   |   +---api
+|   |   |       inventoryAPI.js
+|   |   |       
+|   |   +---hooks
+|   |   |       useInventory.js
+|   |   |       
+|   |   \---queryKeys
+|   |           inventoryKeys.js
+|   |           
+|   +---purchase
+|   |   +---api
+|   |   |       purchaseAPI.js
+|   |   |       
+|   |   \---hooks
+|   |           useCreatePurchase.js
+|   |           
+|   \---suppliers
+|       +---api
+|       |       supplierAPI.js
+|       |       
+|       +---hooks
+|       |       useSuppliers.js
+|       |       
+|       \---queryKeys
+|               supplierKeys.js
+|               
++---layouts
+|       RouteLayout.jsx
+|       
++---pages
+|       Billing.jsx
+|       Dashboard.jsx
+|       Inventory.jsx
+|       Purchase.jsx
+|       
+\---routes
+        AppRoutes.jsx
+        

@@ -1,0 +1,109 @@
+from flask import jsonify, request
+from . import inventory_bp
+from app.services.supplier_service import (
+    create_supplier,
+    list_suppliers
+)
+from app.services.purchase_service import create_purchase
+from app.services.medicine_service import (
+    create_medicine,
+    list_medicines,
+    search_medicines,
+    update_medicine,
+    delete_medicine
+)
+
+
+@inventory_bp.route("/health")
+def health():
+    return jsonify({"status": "inventory ok"})
+
+
+@inventory_bp.route("/suppliers", methods=["POST"])
+def add_supplier():
+
+    data = request.get_json()
+
+    try:
+        result = create_supplier(data)
+        return jsonify(result), 201
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@inventory_bp.route("/suppliers", methods=["GET"])
+def get_suppliers():
+
+    suppliers = list_suppliers()
+
+    return jsonify(suppliers)
+
+
+@inventory_bp.route("/purchases", methods=["POST"])
+def add_purchase():
+
+    data = request.get_json()
+
+    try:
+        result = create_purchase(data)
+        return jsonify(result), 201
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@inventory_bp.route("/medicines", methods=["POST"])
+def add_medicine():
+
+    # data = request.get_json()
+    #
+    # try:
+    #     result = create_medicine(data)
+    #     return jsonify(result), 201
+    #
+    # except Exception as e:
+    #     return jsonify({"error": str(e)}), 400
+
+    return jsonify({
+        "error": "Direct batch creation is disabled. Use /purchases API to add stock."
+    }), 403
+
+
+@inventory_bp.route("/medicines", methods=["GET"])
+def get_medicines():
+
+    medicines = list_medicines()
+
+    return jsonify(medicines)
+
+
+@inventory_bp.route("/medicines/search", methods=["GET"])
+def search():
+
+    keyword = request.args.get("q", "")
+
+    medicines = search_medicines(keyword)
+
+    return jsonify(medicines)
+
+
+@inventory_bp.route("/medicines/<int:medicine_id>", methods=["PUT"])
+def update(medicine_id):
+
+    data = request.get_json()
+
+    try:
+        result = update_medicine(medicine_id, data)
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@inventory_bp.route("/medicines/<int:medicine_id>", methods=["DELETE"])
+def remove(medicine_id):
+
+    result = delete_medicine(medicine_id)
+
+    return jsonify(result)

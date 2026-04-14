@@ -1,0 +1,25 @@
+backend/
+│
+│   config.py
+│   run.py
+│   app/
+│   │   extensions.py
+│   │   models.py
+│   │   schemas.py
+│   │   __init__.py
+│   │   billing/
+│   │   │   routes.py
+│   │   │   __init__.py
+│   │   inventory/
+│   │   │   routes.py
+│   │   │   __init__.py
+│   │   reports/
+│   │   │   routes.py
+│   │   │   __init__.py
+│   │   services/
+│   │   │   billing_service.py
+│   │   │   medicine_service.py
+│   │   │   purchase_service.py
+│   │   │   supplier_service.py
+│   instance/
+│   │   app.sqlite3
