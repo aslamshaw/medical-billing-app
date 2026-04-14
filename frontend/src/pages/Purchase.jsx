@@ -64,6 +64,19 @@ export default function Purchase() {
   };
 
   // -----------------------
+  // Medicine name change
+  // -----------------------
+  const handleSelectMedicine = (item_id, med) => {
+    setForm((prev) => ({
+      ...prev,
+      items: prev.items.map((i) => i.item_id === item_id ? { ...i, medicine_name: med.name } : i
+      ),
+    }));
+
+    setMedicineQuery("");
+  };
+
+  // -----------------------
   // Item change
   // -----------------------
   const handleItemChange = (item_id, e) => {
@@ -290,14 +303,7 @@ export default function Purchase() {
                     {suggestions.map((med) => (
                       <div
                         key={med.id}
-                        onClick={() => {
-                          setForm((prev) => ({
-                            ...prev,
-                            items: prev.items.map((i) => i.item_id === item.item_id ? { ...i, medicine_name: med.name } : i),
-                          }));
-
-                          setMedicineQuery("");
-                        }}
+                        onClick={() => handleSelectMedicine(item.item_id, med)}
                         className="p-2 hover:bg-gray-100 cursor-pointer text-sm"
                       >
                         {med.name}
