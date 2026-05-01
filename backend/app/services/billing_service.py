@@ -1,30 +1,102 @@
 from datetime import datetime, date
 from sqlalchemy import text
 import app.extensions as ext
-from app.models import fetch_one, fetch_all
 
 
 # -------------------------
 # Helper: Deduct stock FEFO
 # -------------------------
-def deduct_stock_fefo(conn, medicine_id, qty):
+def deduct_stock_fefo(conn, medicine_id, qty, *, deduct=True):
     """
     Deducts 'qty' units of a medicine using FEFO (First Expiry First Out) logic.
-    Skips expired batches. Works even if expiry_date includes time.
 
-    Input
-    -----
+    Batches are selected in ascending order of expiry date, ensuring that
+    stock closest to expiration is used first. Expired batches are ignored.
+    Works correctly even if expiry_date includes time.
+
+    Parameters
+    ----------
     conn : SQLAlchemy connection
+        Active database connection. Must be inside a transaction when deduct=True.
     medicine_id : int
+        ID of the medicine to process.
     qty : int
+        Quantity required.
 
-    Output
+    deduct : bool (default=True)
+        Controls whether the function performs actual stock mutation.
+
+        - True  → COMMIT MODE
+          Updates database stock (used during billing).
+          Requires an active transaction (engine.begin()).
+
+        - False → SIMULATION MODE
+          Does NOT modify database.
+          Used for previewing FEFO allocation before billing.
+
+    Returns
+    -------
+    list of dict
+        [
+            {
+                "batch_id": 3,
+                "deducted": 10,
+                "price": 25,
+                "expiry_date": "2026-01-01"
+            },
+            {
+                "batch_id": 5,
+                "deducted": 5,
+                "price": 26,
+                "expiry_date": "2026-03-01"
+            }
+        ]
+
+    Raises
     ------
-    [
-        {"batch_id": 3, "deducted": 10, "price": 25},
-        {"batch_id": 5, "deducted": 5, "price": 26}
-    ]
+    Exception
+        If sufficient non-expired stock is not available,
+        or if a concurrency conflict occurs during update.
+
+    ---------------------------------------------------------------------
+
+    Why the 'deduct' flag exists
+
+    The same FEFO logic is reused for two different purposes:
+
+    1. Simulation (Preview)
+       Determine how stock *would be allocated* without actually changing it.
+
+    2. Commit (Billing)
+       Perform real stock deduction and persist the result.
+
+    This avoids duplicating logic and ensures consistency between preview
+    and actual billing behavior.
+
+    ---------------------------------------------------------------------
+
+    Two-Step Billing Workflow
+
+    This design enables a structured and safer billing process:
+
+    1. Preview Phase (Simulation)
+       The system simulates FEFO allocation before bill creation, showing how the
+       requested quantities will be distributed across available batches based on expiry.
+       No stock is modified during this step.
+
+    2. Validation Step
+       The user verifies that the simulated allocation aligns with the actual physical
+       inventory. This helps identify discrepancies such as damaged, missing, or
+       incorrectly recorded stock.
+
+    3. Commit Phase (Actual Billing)
+       Once validated, the system proceeds with bill creation. FEFO runs in commit mode,
+       deducting stock, inserting bill and batch records, and generating the final receipt.
+
+    This separation improves reliability by avoiding premature stock mutation and
+    introduces a practical validation layer between system data and real-world inventory.
     """
+
     today = date.today().isoformat()
 
     # Fetch non-expired batches in FEFO order
@@ -48,35 +120,133 @@ def deduct_stock_fefo(conn, medicine_id, qty):
             break
 
         available = batch["stock"]
-        deduct = min(available, remaining)
+        deduct_qty = min(available, remaining)
 
-        # Check available stock again before updating
-        result = conn.execute(
-            text("""
-                    UPDATE medicine_batches
-                    SET stock = stock - :deduct
-                    WHERE id = :id AND stock >= :deduct
-                 """),
-            {"deduct": deduct, "id": batch["id"]}
-        )
+        # ---------------------------------------------------------
+        # ONLY COMMIT MODE ACTUALLY MODIFIES DATABASE
+        # ---------------------------------------------------------
+        if deduct:
+            # Check available stock again before updating (concurrency-safe check)
+            result = conn.execute(
+                text("""
+                        UPDATE medicine_batches
+                        SET stock = stock - :deduct
+                        WHERE id = :id AND stock >= :deduct
+                     """),
+                {"deduct": deduct_qty, "id": batch["id"]}
+            )
 
-        # Successful update check
-        if result.rowcount == 0:
-            raise Exception(f"Stock conflict detected for batch {batch['id']}. Try again.")
+            # Successful update check, .rowcount tells how many rows did this SQL statement actually affect
+            if result.rowcount == 0:  # .rowcount is for Data Modification query like UPDATE, DELETE and INSERT
+                raise Exception(f"Stock conflict detected for batch {batch['id']}. Try again.")
 
-        # Record deduction with price
+        # Record deduction with price (same for simulate and commit)
         deductions.append({
             "batch_id": batch["id"],
-            "deducted": deduct,
-            "price": batch["selling_price"]
+            "deducted": deduct_qty,
+            "price": batch["selling_price"],
+            "expiry_date": batch["expiry_date"]
         })
 
-        remaining -= deduct
+        remaining -= deduct_qty
 
     if remaining > 0:
         raise Exception(f"Insufficient non-expired stock for medicine_id {medicine_id}")
 
     return deductions
+
+
+# -------------------------
+# FEFO Preview (NO stock mutation)
+# -------------------------
+def preview_fefo(cart_items):
+    """
+    Simulates FEFO allocation for a cart without modifying stock.
+
+    Input
+    -----
+    cart_items: [
+        {"medicine_id": 1, "quantity": 15},
+        {"medicine_id": 2, "quantity": 5}
+    ]
+
+    Output
+    ------
+    {
+        "items": [
+            {
+                "medicine_id": 1,
+                "requested_qty": 10,
+                "allocations": [
+                    {"batch_id": 5, "qty": 6, "expiry_date": "2025-01-01"},
+                    {"batch_id": 8, "qty": 4, "expiry_date": "2025-03-01"}
+                ]
+            }
+        ],
+        "total": 120
+    }
+
+    Note:
+    A transaction is a safety wrapper, either ALL database changes succeed, or NONE of them are applied.
+
+    conn.connect() → just opens a pipe to the database
+
+    conn.begin() → starts a “protected block” where changes are grouped
+    conn.in_transaction() → tells you if you're currently inside that block
+
+    That is why to simulate FEFO engine.connect() is used.
+
+    Purpose:
+    -------
+    The preview window allows the pharmacist to inspect FEFO-based batch allocation
+    and verify it against physical inventory before billing.
+
+    This step is advisory only. Stock may differ from database due to real-world
+    issues (damage, missing items) or concurrent billing by other users.
+
+    For this reason, preview data is NOT passed to commit. The commit phase always
+    recomputes FEFO using the latest database state, ensuring correctness.
+
+    Example:
+    1. Preview: Batch X → 6, Batch Y → 4 (for 10 units)
+    2. Another user sells 5 units from Batch X
+    3. Commit recomputes:
+       Batch X → 1, Batch Y → 4, Batch Z → 5
+
+    This guarantees correctness under concurrency and prevents stale allocations.
+    """
+
+    results = []
+    total = 0
+
+    with ext.engine.connect() as conn:      # .connect is used to avoid transactions
+        for item in cart_items:
+            medicine_id = item["medicine_id"]
+            qty = item["quantity"]
+
+            allocations = deduct_stock_fefo(conn, medicine_id, qty, deduct=False)   # simulation mode
+
+            # price is assumed consistent per batch allocation
+            item_total = sum(a["deducted"] * a["price"] for a in allocations)
+            total += item_total
+
+            results.append({
+                "medicine_id": medicine_id,
+                "requested_qty": qty,
+                "allocations": [
+                    {
+                        "batch_id": a["batch_id"],
+                        "qty": a["deducted"],
+                        "expiry_date": a["expiry_date"]
+                    }
+                    for a in allocations
+                ]
+            })
+
+    return {
+        "items": results,
+        "total": total
+    }
 
 
 # -------------------------
@@ -97,11 +267,35 @@ def create_bill(cart_items):
     Output
     ------
     {"bill_id": 3, "total": 450}
+
+    Retry-safe billing (idempotency key):
+    ------------------------------------
+    Network failures or client retries can cause duplicate billing requests.
+    To prevent duplicate bills and double stock deduction, each request will
+    later include an idempotency_key that ensures the same request is processed
+    only once.
+
+    Example:
+    1. Client sends request with idempotency_key = "abc123"
+    2. Server creates Bill ID = 101 and stores the key
+    3. Network timeout occurs before response is received
+    4. Client retries same request with idempotency_key = "abc123"
+    5. Server detects existing bill and returns Bill ID = 101 (no re-processing)
+
+
+    Production notes:
+    ------------------
+    - Moving to MySQL will introduce row-level locking and transactional isolation
+      to further reduce race conditions during stock updates.
+    - Authentication will be added to track which user performs billing and
+      stock adjustments for auditability.
+    - Idempotency support will be implemented later to ensure retry-safe billing
+      in production environments.
     """
     total = 0
 
     with ext.engine.begin() as conn:
-        # 1. Create the bill
+        # 1. Create the zero total amount bill for updating later
         result = conn.execute(
             text("""
                     INSERT INTO bills (created_at, total_amount)
@@ -112,7 +306,7 @@ def create_bill(cart_items):
                 "total_amount": 0
             }
         )
-        bill_id = result.lastrowid
+        bill_id = result.lastrowid      # get bill_id of the latest inserted row
 
         # 2. Process each cart item
         for item in cart_items:
@@ -127,13 +321,13 @@ def create_bill(cart_items):
             medicine = conn.execute(
                 text("SELECT id FROM medicines WHERE id=:id"),
                 {"id": medicine_id}
-            ).first()
+            ).mappings().first()
 
             if not medicine:
                 raise Exception(f"Invalid medicine_id {medicine_id}")
 
             # Deduct stock (FEFO)
-            deductions = deduct_stock_fefo(conn, medicine_id, qty)
+            deductions = deduct_stock_fefo(conn, medicine_id, qty, deduct=True)
 
             # -----------------------------
             # SINGLE LOOP (optimized)
@@ -244,10 +438,13 @@ def get_bill(bill_id):
     """
 
     # 1. Fetch bill (same as before)
-    bill = fetch_one(
-        "SELECT * FROM bills WHERE id = :id",
-        {"id": bill_id}
-    )
+    with ext.engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT * FROM bills WHERE id = :id"),
+            {"id": bill_id}
+        ).mappings().first()
+
+        bill = dict(result) if result else None
 
     if not bill:
         return {"error": "Bill not found"}

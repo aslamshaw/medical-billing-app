@@ -1,4 +1,5 @@
-from app.models import insert_record, fetch_all
+from sqlalchemy import text
+import app.extensions as ext
 
 
 # -------------------------
@@ -19,9 +20,7 @@ def create_supplier(data):
 
     Output
     ------
-    {
-        "message": "Supplier created"
-    }
+    { "id": 1, "name": "ABC Pharma", "phone": "9876543210", "address": "Chennai"}
 
     Meaning
     -------
@@ -39,9 +38,23 @@ def create_supplier(data):
     - Add schema validation (Marshmallow)
     """
 
-    insert_record("suppliers", data)
+    with ext.engine.begin() as conn:
+        result = conn.execute(
+            text("""
+                INSERT INTO suppliers (name, phone, address)
+                VALUES (:name, :phone, :address)
+            """),
+            data
+        )
 
-    return {"message": "Supplier created"}
+        supplier_id = result.lastrowid
+
+        supplier = conn.execute(
+            text("SELECT * FROM suppliers WHERE id = :id"),
+            {"id": supplier_id}
+        ).mappings().first()
+
+    return dict(supplier) if supplier else None
 
 
 # -------------------------
@@ -76,4 +89,10 @@ def list_suppliers():
     - No filtering/search
     """
 
-    return fetch_all("SELECT * FROM suppliers ORDER BY name")
+    with ext.engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT * FROM suppliers ORDER BY name")
+        )
+
+        rows = result.mappings().all()
+        return [dict(row) for row in rows]

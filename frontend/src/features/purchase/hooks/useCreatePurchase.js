@@ -12,6 +12,8 @@ export const useCreatePurchase = () => {
       // Invalidate inventory query so it refetches fresh data, which updates cache, causing inventory pages' UI to re-render
       queryClient.invalidateQueries({ queryKey: inventoryKeys.lists(), });
     },
+
+    retry: false,
   });
 };
 

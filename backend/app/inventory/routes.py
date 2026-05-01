@@ -1,17 +1,17 @@
 from flask import jsonify, request
-from . import inventory_bp
+from . import inventory_bp      # inventory bluprint decorator still needs to be imported
 from app.services.supplier_service import (
     create_supplier,
     list_suppliers
 )
 from app.services.purchase_service import create_purchase
 from app.services.medicine_service import (
-    create_medicine,
     list_medicines,
     search_medicines,
     update_medicine,
     delete_medicine
 )
+from app.services.inventory_adjustment_service import adjust_batch_stock
 
 
 @inventory_bp.route("/health")
@@ -53,23 +53,6 @@ def add_purchase():
         return jsonify({"error": str(e)}), 400
 
 
-@inventory_bp.route("/medicines", methods=["POST"])
-def add_medicine():
-
-    # data = request.get_json()
-    #
-    # try:
-    #     result = create_medicine(data)
-    #     return jsonify(result), 201
-    #
-    # except Exception as e:
-    #     return jsonify({"error": str(e)}), 400
-
-    return jsonify({
-        "error": "Direct batch creation is disabled. Use /purchases API to add stock."
-    }), 403
-
-
 @inventory_bp.route("/medicines", methods=["GET"])
 def get_medicines():
 
@@ -107,3 +90,20 @@ def remove(medicine_id):
     result = delete_medicine(medicine_id)
 
     return jsonify(result)
+
+
+@inventory_bp.route("/batches/<int:batch_id>/adjust", methods=["POST"])
+def adjust_stock(batch_id):
+
+    data = request.get_json()
+
+    try:
+        result = adjust_batch_stock(batch_id, data["new_stock"], data["reason"])
+
+        return jsonify(result), 200
+
+    except KeyError:
+        return jsonify({"error": "new_stock and reason are required"}), 400
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400

@@ -12,5 +12,7 @@ export const useCreateSupplier = () => {
       // refresh supplier list instantly
       queryClient.invalidateQueries({ queryKey: supplierKeys.lists(), });
     },
+
+    retry: false,
   });
 };

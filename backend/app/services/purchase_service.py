@@ -1,20 +1,43 @@
 from datetime import datetime
 from sqlalchemy import text
 import app.extensions as ext
-from app.models import fetch_one, insert_record
 
 
 # -------------------------
 # Helper function
 # -------------------------
+"""
+SQLAlchemy returns RowMapping objects when using:
+
+    conn.execute(text(query), params)
+
+To make results JSON serializable, we explicitly convert them to dicts.
+
+For multiple rows:
+    result = conn.execute(text(query), params)
+    rows = result.mappings().all()
+    → rows is: [RowMapping(...), RowMapping(...)]
+    → convert with:
+        [dict(row) for row in rows]
+
+For single row:
+    result = conn.execute(text(query), params)
+    row = result.mappings().first()
+    → RowMapping(...) or None
+    → convert with:
+        dict(row) if row else None
+        
+Note: RowMapping can work like python dict but it is unsafe for JSON.
+"""
+
+
 def get_or_create_medicine(conn, medicine_name):
 
     medicine = conn.execute(
         text("SELECT * FROM medicines WHERE name=:name"),
-        {"name": medicine_name}
-    ).mappings().first()
+        {"name": medicine_name}).mappings().first()
 
-    if not medicine:
+    if medicine is None:
         conn.execute(
             text("INSERT INTO medicines (name) VALUES (:name)"),
             {"name": medicine_name}
@@ -22,10 +45,9 @@ def get_or_create_medicine(conn, medicine_name):
 
         medicine = conn.execute(
             text("SELECT * FROM medicines WHERE name=:name"),
-            {"name": medicine_name}
-        ).mappings().first()
+            {"name": medicine_name}).mappings().first()
 
-    return medicine
+    return dict(medicine) if medicine else None
 
 
 # -------------------------
@@ -113,8 +135,7 @@ def create_purchase(data):
         # Defencive check for supplier_id existence
         supplier = conn.execute(
             text("SELECT id FROM suppliers WHERE id=:id"),
-            {"id": supplier_id}
-        ).first()
+            {"id": supplier_id}).mappings().first()
 
         if not supplier:
             raise Exception("Invalid supplier_id")
@@ -163,6 +184,9 @@ def create_purchase(data):
 
             # 3. resolve medicine
             medicine = get_or_create_medicine(conn, item["medicine_name"])
+
+            if medicine is None:
+                raise Exception(f"Medicine creation/retrieval failed: {item['medicine_name']}")
 
             # 4. create batch
             conn.execute(

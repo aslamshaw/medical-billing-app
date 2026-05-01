@@ -1,11 +1,9 @@
-backend/
-│
+backend
 │   config.py
 │   run.py
 │   app/
-│   │   extensions.py
-│   │   models.py
-│   │   schemas.py
+│   │   extensions.py	(Containing database engine)
+│   │   schemas.py	(database table initialization function)
 │   │   __init__.py
 │   │   billing/
 │   │   │   routes.py

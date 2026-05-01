@@ -1,10 +1,8 @@
-Folder PATH listing
-Volume serial number is 32D9-0B9C
-D:.
+frontend/src
+|
 |   App.jsx
 |   index.css
 |   main.jsx
-|   structure.txt
 |   
 +---assets
 |       hero.png
@@ -13,12 +11,18 @@ D:.
 |   +---inventory
 |   |   +---api
 |   |   |       inventoryAPI.js
+|   |   |       medicineAPI.js
+|   |   |       
+|   |   +---components
+|   |   |       MedicineAutocomplete.jsx
 |   |   |       
 |   |   +---hooks
 |   |   |       useInventory.js
+|   |   |       useMedicineSearch.js
 |   |   |       
 |   |   \---queryKeys
 |   |           inventoryKeys.js
+|   |           medicineKeys.js
 |   |           
 |   +---purchase
 |   |   +---api
@@ -32,6 +36,7 @@ D:.
 |       |       supplierAPI.js
 |       |       
 |       +---hooks
+|       |       useCreateSupplier.js
 |       |       useSuppliers.js
 |       |       
 |       \---queryKeys

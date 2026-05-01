@@ -1,64 +1,5 @@
-from app.models import insert_record, fetch_one, fetch_all, execute_write
-
-
-# -------------------------
-# Create Medicine + Batch
-# -------------------------
-def create_medicine(data):
-    raise Exception("Direct medicine creation disabled. Use purchase API.")
-    """
-    Input
-    -----
-    {
-        "name": "Crocin",
-        "batch_number": "B101",
-        "expiry_date": "2026-01-01",
-        "purchase_price": 18,
-        "selling_price": 25,
-        "stock": 50
-    }
-
-    Meaning
-    -------
-    Adds a medicine batch. If the medicine does not exist in the
-    medicines table, it will be created first.
-
-    Output
-    ------
-    {
-        "message": "Medicine batch added"
-    }
-    """
-
-    # check if medicine exists
-    medicine = fetch_one(
-        "SELECT * FROM medicines WHERE name=:name",
-        {"name": data["name"]}
-    )
-
-    if not medicine:
-
-        insert_record("medicines", {"name": data["name"]})
-
-        # fetch again to get generated primary key i.e. medicine_id
-        medicine = fetch_one(
-            "SELECT * FROM medicines WHERE name=:name",
-            {"name": data["name"]}
-        )
-
-    # prepare batch data using medicine_id and input data for insertion into the medicine_batches table
-    batch_data = {
-        "medicine_id": medicine["id"],
-        "batch_number": data["batch_number"],
-        "expiry_date": data["expiry_date"],
-        "purchase_price": data["purchase_price"],
-        "selling_price": data["selling_price"],
-        "stock": data["stock"]
-    }
-
-    insert_record("medicine_batches", batch_data)
-
-    return {"message": "Medicine batch added"}
+from sqlalchemy import text
+import app.extensions as ext
 
 
 # -------------------------
@@ -92,26 +33,30 @@ def list_medicines():
     from all batches.
     """
 
-    return fetch_all(
-        """
-        SELECT
-            m.id,
-            m.name,
-            COALESCE(SUM(b.stock),0) as total_stock,
-            COALESCE(SUM(
-              CASE
-                WHEN DATE(b.expiry_date) >= DATE('now')
-                THEN b.stock
-                ELSE 0
-              END
-            ), 0) AS valid_stock
-        FROM medicines m
-        LEFT JOIN medicine_batches b
-        ON m.id = b.medicine_id
-        GROUP BY m.id
-        ORDER BY m.name
-        """
-    )
+    with ext.engine.connect() as conn:
+        result = conn.execute(
+            text("""
+            SELECT
+                m.id,
+                m.name,
+                COALESCE(SUM(b.stock),0) as total_stock,
+                COALESCE(SUM(
+                  CASE
+                    WHEN DATE(b.expiry_date) >= DATE('now')
+                    THEN b.stock
+                    ELSE 0
+                  END
+                ), 0) AS valid_stock
+            FROM medicines m
+            LEFT JOIN medicine_batches b
+            ON m.id = b.medicine_id
+            GROUP BY m.id
+            ORDER BY m.name
+            """)
+        )
+
+        rows = result.mappings().all()
+        return [dict(row) for row in rows]
 
 
 # -------------------------
@@ -144,14 +89,18 @@ def search_medicines(keyword):
     Medicine name depends only on medicine_id so it belongs only in medicines, not in medicine_batches.
     """
 
-    return fetch_all(
-        """
-        SELECT * FROM medicines
-        WHERE name LIKE :keyword
-        ORDER BY name
-        """,
-        {"keyword": f"%{keyword}%"}
-    )
+    with ext.engine.connect() as conn:
+        result = conn.execute(
+            text("""
+            SELECT * FROM medicines
+            WHERE name LIKE :keyword
+            ORDER BY name
+            """),
+            {"keyword": f"%{keyword}%"}
+        )
+
+        rows = result.mappings().all()
+        return [dict(row) for row in rows]
 
 
 # -------------------------
@@ -179,19 +128,21 @@ def update_medicine(medicine_id, data):
     Updates the medicine name in the medicines table.
     """
 
-    query = """
-    UPDATE medicines
-    SET name=:name
-    WHERE id=:id
-    """
+    with ext.engine.begin() as conn:
+        result = conn.execute(
+            text("""
+            UPDATE medicines
+            SET name=:name
+            WHERE id=:id
+            """),
+            {
+                "id": medicine_id,
+                "name": data["name"]
+            }
+        )
 
-    execute_write(
-        query,
-        {
-            "id": medicine_id,
-            "name": data["name"]
-        }
-    )
+        if result.rowcount == 0:
+            raise Exception(f"Medicine with id {medicine_id} not found")
 
     return {"message": "Medicine updated"}
 
@@ -220,14 +171,18 @@ def delete_medicine(medicine_id):
     Deletes the medicine and all its batches from the database.
     """
 
-    execute_write(
-        "DELETE FROM medicine_batches WHERE medicine_id=:id",
-        {"id": medicine_id}
-    )
+    with ext.engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM medicine_batches WHERE medicine_id=:id"),
+            {"id": medicine_id}
+        )
 
-    execute_write(
-        "DELETE FROM medicines WHERE id=:id",
-        {"id": medicine_id}
-    )
+        result = conn.execute(
+            text("DELETE FROM medicines WHERE id=:id"),
+            {"id": medicine_id}
+        )
+
+        if result.rowcount == 0:
+            raise Exception(f"Medicine with id {medicine_id} not found")
 
     return {"message": "Medicine deleted"}

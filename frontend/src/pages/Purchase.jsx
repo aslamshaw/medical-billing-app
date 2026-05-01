@@ -1,16 +1,15 @@
 import { useState, useRef, useMemo } from "react";
-import { useCreatePurchase } from "../features/purchase/hooks/useCreatePurchase";
 import { useSuppliers } from "../features/suppliers/hooks/useSuppliers";
 import { useCreateSupplier } from "../features/suppliers/hooks/useCreateSupplier";
+import { useCreatePurchase } from "../features/purchase/hooks/useCreatePurchase";
 import { useMedicineSearch } from "../features/inventory/hooks/useMedicineSearch";
+import MedicineAutocomplete from "../features/inventory/components/MedicineAutocomplete";
+import { toast } from "sonner";
 
 export default function Purchase() {
   const { data: suppliers = [] } = useSuppliers();  // [{ "name": "ABC Pharma", ... }, { "name": MedLife Distributors", ... }]
   const [showSupplierForm, setShowSupplierForm] = useState(false);
   const [supplierForm, setSupplierForm] = useState({ name: "", phone: "", address: "", });
-
-  const [medicineQuery, setMedicineQuery] = useState("");
-  const { data: suggestions = [] } = useMedicineSearch(medicineQuery);
 
   const { mutate: createSupplier, isPending: isCreatingSupplier } = useCreateSupplier();
   const { mutate, isPending } = useCreatePurchase();
@@ -49,9 +48,18 @@ export default function Purchase() {
     if (!supplierForm.name) return;
 
     createSupplier(supplierForm, {
-      onSuccess: () => {
+      onSuccess: (data) => {
+        // reset supplier form UI
         setSupplierForm({ name: "", phone: "", address: "" });
         setShowSupplierForm(false);
+
+        // autoselect newly created supplier keeping consistent with <select> value
+        if (data?.id) { setForm((prev) => ({ ...prev, supplier_id: String(data.id), })); }
+
+        toast.success(`Supplier "${data?.name ?? ""}" created`);
+      },
+      onError: (err) => {
+        toast.error(err?.message || "Failed to create supplier");
       },
     });
   };
@@ -64,19 +72,6 @@ export default function Purchase() {
   };
 
   // -----------------------
-  // Medicine name change
-  // -----------------------
-  const handleSelectMedicine = (item_id, med) => {
-    setForm((prev) => ({
-      ...prev,
-      items: prev.items.map((i) => i.item_id === item_id ? { ...i, medicine_name: med.name } : i
-      ),
-    }));
-
-    setMedicineQuery("");
-  };
-
-  // -----------------------
   // Item change
   // -----------------------
   const handleItemChange = (item_id, e) => {
@@ -85,6 +80,16 @@ export default function Purchase() {
     setForm((prev) => ({
       ...prev,
       items: prev.items.map((item) => item.item_id === item_id ? { ...item, [name]: value } : item),
+    }));
+  };
+
+  // -----------------------
+  // Medicine name change
+  // -----------------------
+  const handleSelectMedicine = (item_id, med) => {
+    setForm((prev) => ({
+      ...prev,
+      items: prev.items.map((i) => i.item_id === item_id ? { ...i, medicine_name: med.name } : i),
     }));
   };
 
@@ -122,13 +127,21 @@ export default function Purchase() {
   // ----------------------------
   // Computed values of total
   // ----------------------------
+  /*
+  
+  A derived value is not state. It is recomputed during render and updates only because something else triggered a render.
+  User changes quantity setForm(...) -> React triggers re-render -> useMemo recomputes totalAmount -> UI shows updated value
+  Even if you don't use useMemo, the updated computed value would still be shown in UI correctly.
+  useMemo is only for performance optimization
+
+  */
   const itemsWithSubtotal = useMemo(() => {   // useMemo avoids computing subtotal for each item in each render
     return form.items.map((item) => {
       const qty = Number(item.quantity) || 0;
       const price = Number(item.purchase_price) || 0;
 
       return { ...item, subtotal: qty * price, };
-    });
+    });   // [{ item_id: 1, ... , subtotal: 20 }, { item_id: 2, ... , subtotal: 15 }]
   }, [form.items]); // callback is pure, no side effects like state update and depends on form.items state
 
   const totalAmount = useMemo(() => {   // useMemo avoids computing total amount in each render
@@ -136,45 +149,86 @@ export default function Purchase() {
   }, [itemsWithSubtotal]);  // derived dependency is fine here only because it’s reused/memoized; otherwise prefer form.items
 
   // -----------------------
-  // Validation
+  // Validation (FULL FORM)
   // -----------------------
   const validate = () => {
-    const newErrors = {};
+    const isInvalidNumber = (value) => { return !value || Number.isNaN(Number(value)) || Number(value) <= 0; };
+
+    // { supplier_id: "Supplier is required", items: { "uuid-1": { med_name: "Required", ...}, "uuid-2": { med_name, } } }
+    const newErrors = { items: {}, };
 
     if (!form.supplier_id) {
       newErrors.supplier_id = "Supplier is required";
     }
 
-    form.items.forEach((item, index) => {
-      const prefix = `item_${index}`;
+    // Track duplicates
+    const seen = new Map(); // key => first item_id
 
-      if (!item.medicine_name) {
-        newErrors[`${prefix}_medicine_name`] = "Required";
+    form.items.forEach((item) => {
+      const itemErrors = {};    // resets for each item
+
+      const med = item.medicine_name?.trim().toLowerCase();
+      const batch = item.batch_number?.trim().toLowerCase();
+
+      // Basic validations
+      if (!item.medicine_name) itemErrors.medicine_name = "Required";
+      if (!item.batch_number) itemErrors.batch_number = "Required";
+      if (!item.expiry_date) itemErrors.expiry_date = "Required";
+
+      if (isInvalidNumber(item.quantity)) itemErrors.quantity = "Invalid";
+      if (isInvalidNumber(item.purchase_price)) itemErrors.purchase_price = "Invalid";
+      if (isInvalidNumber(item.selling_price)) itemErrors.selling_price = "Invalid";
+
+      // Duplicate detection (only if both exist)
+      if (med && batch) {
+        const key = `${med}__${batch}`;
+
+        if (seen.has(key)) {
+          const firstItemId = seen.get(key);
+
+          // mark current item
+          itemErrors.batch_number = "Duplicate batch for this medicine";
+
+          // mark first item also (important)
+          newErrors.items[firstItemId] = {
+            ...(newErrors.items[firstItemId] || {}),
+            batch_number: "Duplicate batch for this medicine",
+          };
+        } 
+        else { seen.set(key, item.item_id); }
       }
 
-      if (!item.batch_number) {
-        newErrors[`${prefix}_batch_number`] = "Required";
-      }
-
-      if (!item.expiry_date) {
-        newErrors[`${prefix}_expiry_date`] = "Required";
-      }
-
-      if (!item.quantity || Number(item.quantity) <= 0) {
-        newErrors[`${prefix}_quantity`] = "Invalid";
-      }
-
-      if (!item.purchase_price || Number(item.purchase_price) <= 0) {
-        newErrors[`${prefix}_purchase_price`] = "Invalid";
-      }
-
-      if (!item.selling_price || Number(item.selling_price) <= 0) {
-        newErrors[`${prefix}_selling_price`] = "Invalid";
+      // Includes this item_id key inside newErrors.items only if that item has at least one validation error
+      // Avoiding empty object for itemErrors in case of no validation error
+      if (Object.keys(itemErrors).length > 0) {
+        newErrors.items[item.item_id] = itemErrors;
       }
     });
 
     setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;   // newErrors object should be empty after validation checks
+
+    return (!newErrors.supplier_id && Object.keys(newErrors.items).length === 0); // No supplier or item error
+  };
+
+  // -----------------------
+  // Field-level validation (onBlur)
+  // -----------------------
+  const handleItemBlur = (item_id, e) => {
+    const { name, value } = e.target;
+
+    let message = "";
+
+    if (!value) {
+      message = "Required";
+    }
+    else if (["quantity", "purchase_price", "selling_price"].includes(name) && Number(value) <= 0) {
+      message = "Invalid";
+    }
+
+    setErrors((prev) => ({
+      ...prev,
+      items: { ...prev.items, [item_id]: { ...prev.items?.[item_id], [name]: message, }, },
+    }));  // initially prev.items is undefined, ..undefined is fine, on first blur ...undefined[item_id] gives TypeError
   };
 
   // -----------------------
@@ -182,11 +236,10 @@ export default function Purchase() {
   // -----------------------
   const lockRef = useRef(false);
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
 
     if (lockRef.current) return;
-
     if (!validate()) return;
 
     lockRef.current = true;
@@ -200,18 +253,54 @@ export default function Purchase() {
         quantity: Number(item.quantity),
         purchase_price: Number(item.purchase_price),
         selling_price: Number(item.selling_price),
-      })),    // Map transformation allows validation of data
+      })),
     };
 
-    mutate(payload, { onSettled: (..._args) => lockRef.current = false });
+    const id = toast.loading("Processing purchase...");   // toast ID is returned to modify same toast instead of creating
+
+    mutate(payload, {
+      onMutate: async () => {   // runs first before mutate, here callback is async due to artificial delay
+        // await new Promise((res) => setTimeout(res, 5000)); // simulate validate step
+
+        toast.loading("Saving...", { id });
+      },
+
+      onSuccess: async (data) => {
+        // await new Promise((res) => setTimeout(res, 500)); // simulate final step
+
+        toast.success(`Purchase #${data?.id ?? ""} created`, { id, description: `Total ₹${totalAmount}`, });
+
+        setForm({
+          supplier_id: "",
+          items: [
+            {
+              item_id: crypto.randomUUID(),
+              medicine_name: "",
+              batch_number: "",
+              expiry_date: "",
+              quantity: "",
+              purchase_price: "",
+              selling_price: "",
+            },
+          ],
+        });
+
+        setErrors({});
+      },
+
+      onError: (err) => { toast.error(err?.message || "Failed to create purchase", { id, }); },
+
+      onSettled: () => { lockRef.current = false; },
+    });
   };
 
   return (
     <div>
       <h2 className="text-xl font-semibold mb-4">Create Purchase</h2>
 
-      {/* Create supplier */}
       <form onSubmit={handleSubmit} className="space-y-6">
+
+        {/* Create supplier */}
         <div className="mb-4">
 
           <div className="flex justify-between items-center mb-2">
@@ -264,17 +353,16 @@ export default function Purchase() {
         {/* Supplier Dropdown */}
         {/* 
         
-        Initially value is "" thus "Select Supplier" option is selected.
+        Initially option value was "" thus "Select Supplier" was selected as the form.supplier_id was also ""
         When an option from drop down is selected, onChange triggers 
         Thus, the option value i.e. supplier_id is used to update form.supplier_id
         Now the initial value form.supplier_id is now updated to e.target.value of that option.
         
-        */
-        }
+        */}
         <div>
           <select value={form.supplier_id} onChange={handleSupplierSelect} className="border p-2 w-full">
             <option value="">Select Supplier</option>
-            {suppliers.map((s) => (<option key={s.id} value={s.id}> {s.name}</option>))}
+            {suppliers.map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
           </select>
 
           {errors.supplier_id && (<p className="text-red-500 text-sm">{errors.supplier_id}</p>)}
@@ -285,76 +373,108 @@ export default function Purchase() {
           <div key={item.item_id} className="border p-4 rounded-lg space-y-3">
 
             <div className="grid grid-cols-6 gap-2">
-
-              <div className="relative col-span-2">
-                <input
-                  name="medicine_name"
-                  placeholder="Medicine"
+              <div className="col-span-2">
+                <MedicineAutocomplete
                   value={item.medicine_name}
-                  onChange={(e) => {
-                    handleItemChange(item.item_id, e);
-                    setMedicineQuery(e.target.value);
-                  }}
-                  className="border p-2 w-full"
+                  // { target: { name, value } } mimics onChange callback parameter event (e) => {} for the handler usage
+                  onChange={(val) => handleItemChange(item.item_id, { target: { name: "medicine_name", value: val }, })}
+                  onSelect={(med) => handleSelectMedicine(item.item_id, med)}
                 />
 
-                {suggestions.length > 0 && item.medicine_name === medicineQuery && (
-                  <div className="absolute bg-white border w-full mt-1 max-h-40 overflow-y-auto z-10">
-                    {suggestions.map((med) => (
-                      <div
-                        key={med.id}
-                        onClick={() => handleSelectMedicine(item.item_id, med)}
-                        className="p-2 hover:bg-gray-100 cursor-pointer text-sm"
-                      >
-                        {med.name}
-                      </div>
-                    ))}
-                  </div>
+                {errors.items?.[item.item_id]?.medicine_name && (
+                  <p className="text-red-500 text-xs">
+                    {errors.items[item.item_id].medicine_name}
+                  </p>
                 )}
               </div>
 
-              <input
-                name="batch_number"
-                placeholder="Batch"
-                value={item.batch_number}
-                onChange={(e) => handleItemChange(item.item_id, e)}
-                className="border p-2"
-              />
+              <div>
+                <input
+                  name="batch_number"
+                  placeholder="Batch"
+                  value={item.batch_number}
+                  onChange={(e) => handleItemChange(item.item_id, e)}
+                  onBlur={(e) => handleItemBlur(item.item_id, e)}
+                  className="border p-2"
+                />
 
-              <input
-                type="date"
-                name="expiry_date"
-                value={item.expiry_date}
-                onChange={(e) => handleItemChange(item.item_id, e)}
-                className="border p-2"
-              />
+                {errors.items?.[item.item_id]?.batch_number && (
+                  <p className="text-red-500 text-xs">
+                    {errors.items[item.item_id].batch_number}
+                  </p>
+                )}
+              </div>
 
-              <input
-                type="number"
-                name="quantity"
-                placeholder="Qty"
-                value={item.quantity}
-                onChange={(e) => handleItemChange(item.item_id, e)}
-                className="border p-2"
-              />
+              <div>
+                <input
+                  type="date"
+                  name="expiry_date"
+                  value={item.expiry_date}
+                  onChange={(e) => handleItemChange(item.item_id, e)}
+                  onBlur={(e) => handleItemBlur(item.item_id, e)}
+                  className="border p-2"
+                />
 
-              <input
-                type="number"
-                name="purchase_price"
-                placeholder="Buy"
-                value={item.purchase_price}
-                onChange={(e) => handleItemChange(item.item_id, e)}
-                className="border p-2"
-              />
+                {errors.items?.[item.item_id]?.expiry_date && (
+                  <p className="text-red-500 text-xs">
+                    {errors.items[item.item_id].expiry_date}
+                  </p>
+                )}
+              </div>
 
-              <input
-                type="number"
-                name="selling_price"
-                placeholder="Sell"
-                value={item.selling_price}
-                onChange={(e) => handleItemChange(item.item_id, e)}
-                className="border p-2"
-              />
+              <div>
+                <input
+                  type="number"
+                  name="quantity"
+                  placeholder="Qty"
+                  value={item.quantity}
+                  onChange={(e) => handleItemChange(item.item_id, e)}
+                  onBlur={(e) => handleItemBlur(item.item_id, e)}
+                  className="border p-2"
+                />
+
+                {errors.items?.[item.item_id]?.quantity && (
+                  <p className="text-red-500 text-xs">
+                    {errors.items[item.item_id].quantity}
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <input
+                  type="number"
+                  name="purchase_price"
+                  placeholder="Buy"
+                  value={item.purchase_price}
+                  onChange={(e) => handleItemChange(item.item_id, e)}
+                  onBlur={(e) => handleItemBlur(item.item_id, e)}
+                  className="border p-2"
+                />
+
+                {errors.items?.[item.item_id]?.purchase_price && (
+                  <p className="text-red-500 text-xs">
+                    {errors.items[item.item_id].purchase_price}
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <input
+                  type="number"
+                  name="selling_price"
+                  placeholder="Sell"
+                  value={item.selling_price}
+                  onChange={(e) => handleItemChange(item.item_id, e)}
+                  onBlur={(e) => handleItemBlur(item.item_id, e)}
+                  className="border p-2"
+                />
+
+                {errors.items?.[item.item_id]?.selling_price && (
+                  <p className="text-red-500 text-xs">
+                    {errors.items[item.item_id].selling_price}
+                  </p>
+                )}
+              </div>
 
             </div>
 
@@ -380,7 +500,11 @@ export default function Purchase() {
         </div>
 
         {/* Submit */}
-        <button type="submit" disabled={isPending} className="bg-blue-500 text-white px-4 py-2">
+        <button
+          type="submit"
+          disabled={isPending}
+          className={`px-4 py-2 text-white ${isPending ? "bg-blue-300 cursor-not-allowed" : "bg-blue-500"}`}
+        >
           {isPending ? "Saving..." : "Create Purchase"}
         </button>
       </form>
