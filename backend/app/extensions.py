@@ -23,8 +23,9 @@ def init_engine(url, echo=False):
         # enforce foreign keys
         cursor.execute("PRAGMA foreign_keys=ON")
 
-        # better concurrency
-        cursor.execute("PRAGMA journal_mode=WAL")
+        # WAL for better concurrency i.e. multiple sqlite files and DELETE for ease i.e. single sqlite file
+        # cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA journal_mode=DELETE")
 
         # prevent immediate lock failure
         cursor.execute("PRAGMA busy_timeout=5000")

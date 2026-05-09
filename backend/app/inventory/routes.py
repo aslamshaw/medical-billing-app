@@ -98,12 +98,12 @@ def adjust_stock(batch_id):
     data = request.get_json()
 
     try:
-        result = adjust_batch_stock(batch_id, data["new_stock"], data["reason"])
+        result = adjust_batch_stock(batch_id, data["adjustment"], data["reason"])
 
         return jsonify(result), 200
 
     except KeyError:
-        return jsonify({"error": "new_stock and reason are required"}), 400
+        return jsonify({"error": "adjustment and reason are required"}), 400
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400

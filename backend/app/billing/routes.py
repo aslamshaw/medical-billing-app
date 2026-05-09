@@ -25,7 +25,14 @@ def create():
     data = request.get_json()
 
     try:
-        result = create_bill(data["items"])
+        if "idempotency_key" not in data:
+            return jsonify({"error": "idempotency_key required"}), 400
+
+        if "items" not in data:
+            return jsonify({"error": "items required"}), 400
+
+        result = create_bill(data["idempotency_key"], data["items"])
+
         return jsonify(result), 201
 
     except Exception as e:

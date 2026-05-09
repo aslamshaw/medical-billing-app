@@ -1,6 +1,51 @@
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 import app.extensions as ext
+
+
+# -------------------------
+# Helper: CAS check
+# -------------------------
+def cas_deduct_batch_stock(conn, batch_id, deduct_qty):
+    batch = conn.execute(
+        text("""
+            SELECT stock
+            FROM medicine_batches
+            WHERE id = :id
+        """),
+        {"id": batch_id}
+    ).mappings().first()
+
+    if not batch:
+        raise Exception("Batch not found")
+
+    # Before updating the stock extract that stale stock as old_stock
+    old_stock = batch["stock"]
+    new_stock = old_stock - deduct_qty
+
+    # The updated stock should always be positive thus deduct quantity should be smaller than the stock present
+    if new_stock < 0:
+        raise Exception("INSUFFICIENT_STOCK")
+
+    result = conn.execute(
+        text("""
+            UPDATE medicine_batches
+            SET stock = :new_stock
+            WHERE id = :id AND stock = :old_stock
+        """),
+        {
+            "id": batch_id,
+            "old_stock": old_stock,
+            "new_stock": new_stock
+        }
+    )
+
+    # CAS condition `stock = :old_stock` would fail if a concurrent update changed the stock, no rows would be updated
+    if result.rowcount == 0:
+        raise Exception("CAS_CONFLICT")
+
+    return None
 
 
 # -------------------------
@@ -95,6 +140,11 @@ def deduct_stock_fefo(conn, medicine_id, qty, *, deduct=True):
 
     This separation improves reliability by avoiding premature stock mutation and
     introduces a practical validation layer between system data and real-world inventory.
+
+    Production notes:
+    ------------------
+    - Expiry date validation is intentionally deferred; frontend already restricts input via HTML date field,
+      and strict ISO (YYYY-MM-DD) enforcement will be added later at the schema/serialization layer (like Marshmallow).
     """
 
     today = date.today().isoformat()
@@ -126,19 +176,8 @@ def deduct_stock_fefo(conn, medicine_id, qty, *, deduct=True):
         # ONLY COMMIT MODE ACTUALLY MODIFIES DATABASE
         # ---------------------------------------------------------
         if deduct:
-            # Check available stock again before updating (concurrency-safe check)
-            result = conn.execute(
-                text("""
-                        UPDATE medicine_batches
-                        SET stock = stock - :deduct
-                        WHERE id = :id AND stock >= :deduct
-                     """),
-                {"deduct": deduct_qty, "id": batch["id"]}
-            )
-
-            # Successful update check, .rowcount tells how many rows did this SQL statement actually affect
-            if result.rowcount == 0:  # .rowcount is for Data Modification query like UPDATE, DELETE and INSERT
-                raise Exception(f"Stock conflict detected for batch {batch['id']}. Try again.")
+            # FIX: CAS-based deduction replaces stock >= deduct logic
+            cas_deduct_batch_stock(conn, batch["id"], deduct_qty)
 
         # Record deduction with price (same for simulate and commit)
         deductions.append({
@@ -183,7 +222,8 @@ def preview_fefo(cart_items):
                 ]
             }
         ],
-        "total": 120
+        "total": 120,
+        "note": "Stock allocation may change during billing due to concurrent updates"
     }
 
     Note:
@@ -219,24 +259,37 @@ def preview_fefo(cart_items):
     results = []
     total = 0
 
-    with ext.engine.connect() as conn:      # .connect is used to avoid transactions
+    with ext.engine.connect() as conn:  # .connect is used to avoid transactions
         for item in cart_items:
             medicine_id = item["medicine_id"]
             qty = item["quantity"]
 
-            allocations = deduct_stock_fefo(conn, medicine_id, qty, deduct=False)   # simulation mode
+            # Validate medicine existence
+            medicine = conn.execute(
+                text("SELECT id FROM medicines WHERE id = :id AND is_active = 1"),
+                {"id": medicine_id}
+            ).mappings().first()
 
-            # price is assumed consistent per batch allocation
+            if not medicine:
+                raise Exception(f"Invalid medicine_id {medicine_id}")
+
+            # FEFO simulation
+            allocations = deduct_stock_fefo(conn, medicine_id, qty, deduct=False)
+
+            # Price is assumed consistent per batch allocation
             item_total = sum(a["deducted"] * a["price"] for a in allocations)
             total += item_total
 
             results.append({
                 "medicine_id": medicine_id,
                 "requested_qty": qty,
+                "subtotal": item_total,
                 "allocations": [
                     {
                         "batch_id": a["batch_id"],
                         "qty": a["deducted"],
+                        "price": a["price"],
+                        "batch_subtotal": a["deducted"] * a["price"],
                         "expiry_date": a["expiry_date"]
                     }
                     for a in allocations
@@ -245,14 +298,168 @@ def preview_fefo(cart_items):
 
     return {
         "items": results,
-        "total": total
+        "total": total,
+        "note": "Stock allocation may change during billing due to concurrent updates"
     }
 
 
 # -------------------------
-# Create Bill
+# Helper: Reserve bill request and return request status
 # -------------------------
-def create_bill(cart_items):
+PROCESSING_TIMEOUT_SECONDS = 300  # 5 minutes
+
+
+def reserve_idempotency_key(conn, idempotency_key):
+    """
+    Attempts to reserve an idempotency key safely.
+
+    Returns:
+        "RESERVED"
+        "COMPLETED"
+        "PROCESSING"
+
+    Strategy
+    --------
+    1. Try inserting PROCESSING row
+    2. If insert succeeds:
+           -> this request owns processing
+    3. If insert conflicts:
+           -> inspect existing row
+    4. COMPLETED:
+           -> safe replay
+    5. PROCESSING but fresh:
+           -> another worker still active
+    6. PROCESSING but stale:
+           -> attempt CAS-style takeover
+    """
+
+    now = datetime.utcnow()
+
+    # 1. Try to reserve key
+    # First request: bill_id is not yet created i.e. null also bill_request status is "PROCESSING"
+    # created_at and updated_at are both the current request's created time.
+    try:
+        conn.execute(
+            text("""
+                INSERT INTO bill_requests
+                (idempotency_key, status, created_at, updated_at)
+                VALUES
+                (:key, 'PROCESSING', :now, :now)
+            """),
+            {
+                "key": idempotency_key,
+                "now": now.isoformat()
+            }
+        )
+
+        # Successfully reserved as the bill_request status is "PROCESSING"
+        # This worker own the billing job. Now this request continues into stock deduction -> bill creation
+        return "RESERVED"
+
+    # 2. Key already exist, get the existing bill_request of that key
+    except IntegrityError:
+
+        existing = conn.execute(
+            text("""
+                SELECT id, status, updated_at
+                FROM bill_requests
+                WHERE idempotency_key = :key
+            """),
+            {"key": idempotency_key}
+        ).mappings().first()
+
+        if not existing:
+            raise Exception("Idempotency row missing after conflict")
+
+        # 3. Existing bill_request has already been completed i.e. bill is created
+        if existing["status"] == "COMPLETED":
+            return "COMPLETED"
+
+        # 4. Request is still in process
+        # Get the existing updated_at and calculate time passed since the existing request and this current request
+        existing_updated_at = existing["updated_at"]
+        age_seconds = (now - datetime.fromisoformat(existing_updated_at)).total_seconds()
+
+        # 4a Fresh processing request: Current request is under timeout
+        # Another worker is probably still actively billing, raise Exception for this request
+        if age_seconds <= PROCESSING_TIMEOUT_SECONDS:
+            return "PROCESSING"
+
+        # 4b Stale processing request: Current request is above timeout
+        # Existing worker is dead. Someone must recover it.
+        # Attempt CAS-style takeover, only recover ownership if updated_at has NOT changed by concurrent stale requests.
+        # This prevents two retry requests from simultaneously taking ownership.
+        # Update the updated_at for the existing bill_request with this stale processing request's created time.
+        result = conn.execute(
+            text("""
+                UPDATE bill_requests
+                SET updated_at = :now
+                WHERE id = :id
+                  AND updated_at = :old_updated_at
+            """),
+            {
+                "id": existing["id"],
+                "now": now.isoformat(),
+                "old_updated_at": existing_updated_at
+            }
+        )
+
+        # CAS Success: For the existing bill_request, updated_at time has been updated
+        # This worker now takes the ownership and continues making the bill as the bill_request is reserved
+        if result.rowcount == 1:
+            return "RESERVED"
+
+        # CAS Filed: Another concurrent stale processing request already took the ownership
+        # This request lost the race to a concurrent request
+        return "PROCESSING"
+
+
+# -------------------------
+# Helper: Set request status as completed
+# -------------------------
+def mark_bill_request_completed(conn, idempotency_key, bill_id):
+
+    conn.execute(
+        text("""
+            UPDATE bill_requests
+            SET
+                status = 'COMPLETED',
+                bill_id = :bill_id
+            WHERE idempotency_key = :key
+        """),
+        {
+            "bill_id": bill_id,
+            "key": idempotency_key
+        }
+    )
+
+
+# -------------------------
+# Helper: Get the completed bill
+# -------------------------
+def get_completed_bill(conn, idempotency_key):
+
+    row = conn.execute(
+        text("""
+            SELECT
+                br.bill_id,
+                b.total_amount
+            FROM bill_requests br
+            JOIN bills b
+                ON br.bill_id = b.id
+            WHERE br.idempotency_key = :key
+              AND br.status = 'COMPLETED'
+        """),
+        {"key": idempotency_key}
+    ).mappings().first()
+
+    return dict(row) if row else None
+
+
+# -------------------------
+# Try Create Bill
+# -------------------------
+def try_create_bill(idempotency_key, cart_items):
     """
     Processes a cart of medicines, deducts stock FEFO,
     inserts bill and bill_items, returns bill id and total.
@@ -289,13 +496,40 @@ def create_bill(cart_items):
       to further reduce race conditions during stock updates.
     - Authentication will be added to track which user performs billing and
       stock adjustments for auditability.
-    - Idempotency support will be implemented later to ensure retry-safe billing
-      in production environments.
+    - To match preview stock with committed stock, preview stock can be temporarily reserved
+      for a period of 2–5 minutes, during which the pharmacist can check the physical stock.
+      If the time expires, the reservation becomes stale, and the preview stock may not match the committed stock
+      due to concurrent updates to that medicine’s stock by other users.
     """
     total = 0
 
     with ext.engine.begin() as conn:
-        # 1. Create the zero total amount bill for updating later
+
+        # 1. Store the bill request with idempotency_key
+        # For first request status = "RESERVED", but bill_requests's status column is "PROCESSING"
+        status = reserve_idempotency_key(conn, idempotency_key)
+
+        # Duplicate completed request
+        if status == "COMPLETED":
+
+            existing_bill = get_completed_bill(conn, idempotency_key)
+
+            if not existing_bill:
+                raise Exception("Completed request missing bill")
+
+            return {
+                "bill_id": existing_bill["bill_id"],
+                "total": existing_bill["total_amount"],
+                "idempotent_replay": True
+            }
+
+        # This won't trigger for the first request as status === "RESERVED"
+        # Other requests with same key would fetch existing bill_request's status which is "PROCESSING"
+        # Thus, that request would get this error
+        if status == "PROCESSING":
+            raise Exception("Request already processing")
+
+        # 2. Create the zero total amount bill for updating later
         result = conn.execute(
             text("""
                     INSERT INTO bills (created_at, total_amount)
@@ -306,9 +540,9 @@ def create_bill(cart_items):
                 "total_amount": 0
             }
         )
-        bill_id = result.lastrowid      # get bill_id of the latest inserted row
+        bill_id = result.lastrowid  # get bill_id of the latest inserted row
 
-        # 2. Process each cart item
+        # 3. Process each cart item
         for item in cart_items:
             medicine_id = item["medicine_id"]
             qty = item["quantity"]
@@ -319,14 +553,14 @@ def create_bill(cart_items):
 
             # Defencive check for medicine_id existence
             medicine = conn.execute(
-                text("SELECT id FROM medicines WHERE id=:id"),
+                text("SELECT id FROM medicines WHERE id = :id AND is_active = 1"),
                 {"id": medicine_id}
             ).mappings().first()
 
             if not medicine:
-                raise Exception(f"Invalid medicine_id {medicine_id}")
+                raise Exception(f"Medicine {medicine_id} is inactive or does not exist")
 
-            # Deduct stock (FEFO)
+            # Deduct stock (FEFO) with CAS
             deductions = deduct_stock_fefo(conn, medicine_id, qty, deduct=True)
 
             # -----------------------------
@@ -346,7 +580,7 @@ def create_bill(cart_items):
                     "batch_subtotal": d["batch_subtotal"]
                 })
 
-            weighted_average_price = round(subtotal / qty, 2)
+            weighted_average_price = subtotal / qty
 
             # Insert bill_item
             result = conn.execute(
@@ -365,11 +599,11 @@ def create_bill(cart_items):
                 }
             )
 
-            bill_item_id = result.lastrowid     # latest bill item's auto incremented id as an integer
+            bill_item_id = result.lastrowid  # latest bill item's auto incremented id as an integer
 
             # Attach bill_item_id to each row
             for row in batch_rows:
-                row["bill_item_id"] = bill_item_id      # same bill_item_id throughout the rows
+                row["bill_item_id"] = bill_item_id  # same bill_item_id throughout the rows
 
             # Bulk insert batch breakdown
             conn.execute(
@@ -384,7 +618,7 @@ def create_bill(cart_items):
 
             total += subtotal
 
-        # 3. Update bill total
+        # 4. Update bill total
         conn.execute(
             text("""
                     UPDATE bills
@@ -394,7 +628,31 @@ def create_bill(cart_items):
             {"total": total, "id": bill_id}
         )
 
+        # 5. Mark bill request status as completed
+        mark_bill_request_completed(conn, idempotency_key, bill_id)
+
     return {"bill_id": bill_id, "total": total}
+
+
+# -------------------------
+# Create Bill
+# -------------------------
+MAX_RETRIES = 3  # centralized retry control
+
+
+def create_bill(idempotency_key, cart_items):
+    # While logging, user can change a stock and gets logged but this change can be rollback leaving incomplete log.
+    # Retry the whole process of creating complete bill instead of just retrying per item deducts make logs accurate.
+    for attempt in range(MAX_RETRIES):
+        try:
+            return try_create_bill(idempotency_key, cart_items)
+
+        # ONLY retry CAS / concurrency failures
+        except Exception as e:
+            if "CAS_CONFLICT" in str(e) and attempt < MAX_RETRIES - 1:
+                continue
+            raise
+    return None
 
 
 # -------------------------
@@ -645,9 +903,9 @@ Lock batches using FOR UPDATE in deduct_stock_fefo function:
         ""),
         {"medicine_id": medicine_id, "today": today}
     ).mappings().all()
-    
+
 Thus, all medicines processed inside that transaction, commit happens only once at the end.
-    
+
 SELECT ... FOR UPDATE is a row-level lock acquisition command 
 used in transactional databases like PostgreSQL and MySQL (InnoDB).
 When one transaction reads a row → others must wait, no more “two people reading the same stock and fighting later”.
@@ -809,7 +1067,62 @@ then when all the medicine_ids get's processed in
 cart_items = sorted(cart_items, key=lambda x: x["medicine_id"])
 for item in cart_items:
     ...
-    
 
+
+FEFO Concurrency Scenario and Retry Behavior
+----------
+
+In the FEFO (First Expiry First Out) logic, batches are first selected
+and sorted in ascending order based on their expiry date.
+
+However, between the SELECT (read) phase and the UPDATE (write) phase,
+a concurrent user may modify the stock of one or more batches. This
+creates a race condition where the initially selected data becomes stale.
+
+Example scenario:
+
+Initial state:
+| batch_id | stock |
+|----------|-------|
+| A        | 10    |
+| B        | 10    |
+
+Two concurrent users:
+- User 1 requests 15 units
+- User 2 requests 5 units
+
+Step 1: Both users read the same batch state
+A → 10
+B → 10
+
+Step 2: User 1 processes first
+- Deduct 10 from batch A → success (A = 0)
+- Deduct 5 from batch B → success (B = 5)
+
+Step 3: User 2 processes using stale data
+- Attempts to deduct 5 from batch A
+- This fails because A now has 0 stock
+- The UPDATE condition (stock >= deduct) fails, resulting in rowcount == 0
+- An exception is raised: "Stock conflict detected"
+
+This failure occurs even though sufficient stock still exists in batch B,
+which is the next valid batch according to FEFO.
+
+Retry behavior:
+
+With retry logic implemented, the entire FEFO deduction process is
+re-executed:
+
+- The SELECT query runs again
+- Batch A is excluded because stock = 0 (filtered by stock > 0)
+- Only batch B is selected
+- Deduction is attempted on batch B
+- The UPDATE succeeds, and the operation completes correctly
+
+Key takeaway:
+
+Retrying allows the system to discard the stale plan and recompute
+the FEFO allocation using the latest database state, ensuring that
+valid stock is not incorrectly rejected due to concurrency.
 
 """

@@ -3,156 +3,162 @@ from datetime import datetime
 import app.extensions as ext
 
 
-# -------------------------
-# Adjust Batch Stock (SAFE VERSION - SQLite CAS based)
-# -------------------------
-def adjust_batch_stock(batch_id, new_stock, reason):
-    """
-    Adjust stock of a medicine batch with concurrency-safe update and audit logging.
+# ------------------------------------------------------------
+# INTERNAL HELPERS
+# ------------------------------------------------------------
 
-    This function is designed for SQLite MVP but uses a production-safe pattern
-    called Compare-And-Set (CAS) to avoid race conditions.
+def cas_adjust_batch_stock(conn, batch_id, adjustment, reason):
+    """
+    Performs a single Compare And Set based stock update attempt.
+
+    Input
+    ------
+    batch_id    : int
+    adjustment  : int
+    reason      : str
+
+    Output
+    ------
+    {
+        "old_stock": int,
+        "new_stock": int | None
+    }
+
+    NOTE:
+    This function does NOT retry.
+    It represents ONE atomic attempt only.
+    """
+
+    batch = conn.execute(
+        text("""
+            SELECT stock
+            FROM medicine_batches
+            WHERE id = :id
+        """),
+        {"id": batch_id}
+    ).mappings().first()
+
+    if not batch:
+        raise Exception("Batch not found")
+
+    # Before updating the stock extract that stale stock as old_stock
+    old_stock = batch["stock"]
+    new_stock = old_stock + adjustment
+
+    # The updated stock should always be positive thus deduct quantity should be smaller than the stock present
+    if new_stock < 0:
+        raise Exception("INSUFFICIENT_STOCK")
+
+    result = conn.execute(
+        text("""
+            UPDATE medicine_batches
+            SET stock = :new_stock
+            WHERE id = :batch_id
+              AND stock = :old_stock
+        """),
+        {
+            "batch_id": batch_id,
+            "old_stock": old_stock,
+            "new_stock": new_stock
+        }
+    )
+
+    # CAS condition `stock = :old_stock` would fail if a concurrent update changed the stock, no rows would be updated
+    if result.rowcount == 0:
+        raise Exception("CAS_CONFLICT")
+
+    conn.execute(
+        text("""
+            INSERT INTO stock_adjustments
+            (batch_id, old_stock, new_stock, reason, created_at)
+            VALUES
+            (:batch_id, :old_stock, :new_stock, :reason, :created_at)
+        """),
+        {
+            "batch_id": batch_id,
+            "old_stock": old_stock,
+            "new_stock": new_stock,
+            "reason": reason,
+            "created_at": datetime.utcnow().isoformat()
+        }
+    )
+
+    return {
+        "old_stock": old_stock,
+        "new_stock": new_stock
+    }
+
+
+# ------------------------------------------------------------
+# Try Adjust Batch Stock
+# ------------------------------------------------------------
+def try_adjust_batch_stock(batch_id, adjustment, reason):
+    """
+    Adjust stock of a medicine batch using delta-based updates
+    with concurrency-safe Compare-And-Set (CAS) protection + retry layer.
 
     Input
     ------
     batch_id   : int  -> ID of batch to update
-    new_stock  : int  -> final stock value after adjustment
+    adjustment : int  -> stock delta (+ increase, - decrease)
     reason     : str  -> reason for adjustment
 
     Allowed reasons:
-    - DAMAGED
-    - LOST
-    - EXPIRED
+        - DAMAGED
+        - LOST
+        - EXPIRED
+        - RESTOCK
+        - SALE_ADJUSTMENT
 
     Output
     ------
     {
         "batch_id": 1,
         "old_stock": 10,
-        "new_stock": 5,
-        "reason": "DAMAGED"
+        "adjustment": -2,
+        "new_stock": 8,
+        "reason": "SALE_ADJUSTMENT"
     }
     """
-    # ------------------------------------------------------------
-    # STEP 1: validate input
-    # ------------------------------------------------------------
 
-    if new_stock < 0:
-        raise Exception("Stock cannot be negative")
+    if not isinstance(adjustment, int):
+        raise Exception("Adjustment must be an integer")
 
-    if reason not in {"DAMAGED", "LOST", "EXPIRED"}:
+    if reason not in {"DAMAGED", "LOST", "EXPIRED", "RESTOCK", "SALE_ADJUSTMENT"}:
         raise Exception("Invalid reason")
 
     with ext.engine.begin() as conn:
 
-        # ---------------------------------------------------------
-        # STEP 2: read current stock (needed for CAS comparison)
-        # ---------------------------------------------------------
-        #
-        # We must fetch current value so we can use it in:
-        #   WHERE stock = :old_stock
-        #
-        # NOTE:
-        # This read is NOT protected from concurrent writes.
-        # Protection happens at UPDATE time (CAS check).
-        # ---------------------------------------------------------
-        batch = conn.execute(
-            text("""
-                SELECT stock
-                FROM medicine_batches
-                WHERE id = :id
-            """),
-            {"id": batch_id}
-        ).mappings().first()
+        result = cas_adjust_batch_stock(conn, batch_id, adjustment, reason)
 
-        if not batch:
-            raise Exception("Batch not found")
-
-        old_stock = batch["stock"]
-
-        # ---------------------------------------------------------
-        # STEP 3: CAS UPDATE (CRITICAL PART)
-        # ---------------------------------------------------------
-        #
-        # This is the concurrency safety mechanism.
-        #
-        # The condition:
-        #   AND stock = :old_stock
-        #
-        # means:
-        #   "Only update if no other transaction changed stock"
-        #
-        # This prevents:
-        #   - lost updates
-        #   - stale writes
-        #   - silent overwrites
-        # ---------------------------------------------------------
-        result = conn.execute(
-            text("""
-                UPDATE medicine_batches
-                SET stock = :new_stock
-                WHERE id = :batch_id
-                  AND stock = :old_stock
-            """),
-            {
-                "new_stock": new_stock,
-                "batch_id": batch_id,
-                "old_stock": old_stock
-            }
-        )
-
-        # ---------------------------------------------------------
-        # STEP 4: concurrency failure detection
-        # ---------------------------------------------------------
-        #
-        # If rowcount == 0, it means:
-        #   - stock was modified by another request
-        #   - CAS condition failed
-        #
-        # So we MUST abort safely.
-        # ---------------------------------------------------------
-        if result.rowcount == 0:
-            raise Exception(
-                "Stock update failed due to concurrent modification. Retry required."
-            )
-
-        # ---------------------------------------------------------
-        # STEP 5: audit log (ONLY after successful update)
-        # ---------------------------------------------------------
-        #
-        # IMPORTANT:
-        # We only log AFTER confirming update succeeded.
-        #
-        # Why?
-        # If we log before checking rowcount, we could store:
-        #   - fake stock changes
-        #   - non-existent updates
-        # ---------------------------------------------------------
-        conn.execute(
-            text("""
-                INSERT INTO stock_adjustments
-                (batch_id, old_stock, new_stock, reason, created_at)
-                VALUES
-                (:batch_id, :old_stock, :new_stock, :reason, :created_at)
-            """),
-            {
-                "batch_id": batch_id,
-                "old_stock": old_stock,
-                "new_stock": new_stock,
-                "reason": reason,
-                "created_at": datetime.utcnow().isoformat()
-            }
-        )
-
-        # ---------------------------------------------------------
-        # STEP 6: response
-        # ---------------------------------------------------------
         return {
             "batch_id": batch_id,
-            "old_stock": old_stock,
-            "new_stock": new_stock,
+            "old_stock": result["old_stock"],
+            "adjustment": adjustment,
+            "new_stock": result["new_stock"],
             "reason": reason
         }
+
+
+# ------------------------------------------------------------
+# PUBLIC API: Adjust Batch Stock
+# ------------------------------------------------------------
+MAX_RETRIES = 3
+
+
+def adjust_batch_stock(batch_id, adjustment, reason):
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            return try_adjust_batch_stock(batch_id, adjustment, reason)
+
+        except Exception as e:
+            if "CAS_CONFLICT" in str(e) and attempt < MAX_RETRIES - 1:
+                continue
+            raise
+
+    raise Exception("Stock update failed after retries")
+
 
 
 """
@@ -170,14 +176,28 @@ WHY THIS IS REQUIRED (CRITICAL)
 
 Without CAS:
 
-    Request A reads stock = 10
-    Request B reads stock = 10
+    Initial stock = 10
 
-    A sets stock = 5
-    B sets stock = 3  → overwrites A silently
+    Request A wants: -5
+    Request B wants: -7
+
+    A reads stock = 10
+    B reads stock = 10
+
+    A computes new_stock = 10 - 5 = 5
+    B computes new_stock = 10 - 7 = 3
+
+    A updates stock → 5
+    B updates stock → 3  → overwrites A silently
 
 Final state becomes:
-    stock = 3 (A's update LOST)
+    stock = 3
+
+Problem:
+    A's adjustment (-5) is LOST
+
+Correct result should have been:
+    10 - 5 - 7 = -2 (or rejected if negative not allowed)
 
 This is called:
     LOST UPDATE PROBLEM
@@ -195,30 +215,47 @@ We enforce:
 
 Now:
 
-Scenario:
-
 Initial state:
     stock = 10
 
 Request A:
     reads stock = 10
-    tries UPDATE WHERE stock = 10 → SUCCESS → sets 5
+    computes new_stock = 5
+    updates → SUCCESS
 
 Request B:
-    still thinks stock = 10
-    tries UPDATE WHERE stock = 10 → FAILS (row changed)
+    still has old_stock = 10
+    tries to set new_stock = 3
+    BUT database stock is now 5
+
+    UPDATE ... WHERE stock = 10 → FAILS
 
 Result:
-    - only one update wins
-    - second update is rejected
-    - no silent overwrite
+    - only one update succeeds
+    - second update detects conflict
+    - caller retries with fresh stock
+
+
+RETRY FLOW (IMPORTANT)
+------------------------------------------------------------
+
+On retry:
+
+    Request B reads updated stock = 5
+    computes new_stock = 5 - 7 = -2
+    → rejected (negative stock not allowed)
+
+So:
+    - no overwrite
+    - no lost adjustment
+    - business rules preserved
 
 
 SQLITE BEHAVIOR NOTE (IMPORTANT)
 ------------------------------------------------------------
 
 SQLite does NOT support:
-    SELECT ... FOR UPDATE (row locking)
+    SELECT ... FOR UPDATE
 
 So we cannot rely on:
     pessimistic locking
