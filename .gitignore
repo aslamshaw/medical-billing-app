@@ -20,3 +20,17 @@ yarn-error.log*
 # OS files
 .DS_Store
 Thumbs.db
+
+# Python junk
+__pycache__/
+*.pyc
+
+# Databases
+*.sqlite3
+
+# Python env
+venv/
+.venv/
+
+# Flask instance data
+instance/
